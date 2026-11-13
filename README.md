@@ -24,3 +24,7 @@ Or build from source: `scripts\install.bat` on Windows, `scripts/install.sh` on 
 ---
 
 Менеджер серверов, клиентов и модов Project Zomboid: окно для человека, команды с JSON-ответом и MCP-сервер для ИИ-агентов. Готовые сборки лежат в [Releases](https://github.com/Dark-Ohm/pz-mod-manager/releases). Получил от друга файл `.pzpack` — открой его в «Сборки» → «Открыть .pzpack…».
+
+## License
+
+[MIT](LICENSE)
