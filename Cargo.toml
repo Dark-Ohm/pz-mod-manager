@@ -1,0 +1,23 @@
+[package]
+name = "pz-mod-manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+chrono = "0.4.45"
+dirs = "7.0.0"
+eframe = "0.37.0"
+egui_extras = { version = "0.37.0", features = ["file", "image"] }
+flate2 = "1.1.11"
+fs4 = "1.1.0"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+open = "5.4.5"
+rfd = "0.18.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+tar = "0.4.46"
+toml = "1.2.1"
+ureq = "3.5.2"
+walkdir = "2.5.0"
+zip = "9.5.1"
