@@ -178,6 +178,7 @@ pub const TABLE: &[(&str, &str)] = &[
     ("{} не найден после распаковки", "{} not found after unpacking"),
     ("Повторяю загрузку после обновления SteamCMD…", "Retrying the download after SteamCMD updated itself…"),
     ("не удалось запустить SteamCMD", "could not start SteamCMD"),
+    ("не удалось создать временную папку загрузки", "could not create the temporary download folder"),
     ("Не скачано: {}", "Not downloaded: {}"),
     ("элемент {} не найден в кэше", "item {} not found in the cache"),
     ("клиент", "client"),

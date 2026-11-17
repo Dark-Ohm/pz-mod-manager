@@ -98,8 +98,11 @@ fn run(ids: &[String], tx: &Sender<Msg>) -> Result<bool> {
         if attempt == 2 {
             let _ = tx.send(Msg::Log(t("Повторяю загрузку после обновления SteamCMD…").into()));
         }
+        // Каждая загрузка идёт в свою чистую папку. Общая папка кэша хранит состояние всех
+        // скачанных ранее предметов, и SteamCMD обходит их все (часы работы и зависания).
+        let scratch = fresh_scratch_dir()?;
         let mut cmd = Command::new(&sh);
-        cmd.current_dir(steamcmd_dir()).arg("+force_install_dir").arg(cache_dir()).args(["+login", "anonymous"]);
+        cmd.current_dir(steamcmd_dir()).arg("+force_install_dir").arg(&scratch).args(["+login", "anonymous"]);
         for id in &todo {
             cmd.args(["+workshop_download_item", APP_ID, id]);
         }
@@ -114,12 +117,44 @@ fn run(ids: &[String], tx: &Sender<Msg>) -> Result<bool> {
             pump(&mut out, tx);
         }
         let _ = child.wait()?;
+        let moved = adopt_downloads(&scratch, &todo);
+        let _ = std::fs::remove_dir_all(&scratch);
+        moved?;
     }
     let left = missing(ids);
     if !left.is_empty() {
         let _ = tx.send(Msg::Log(tf!("Не скачано: {}", left.join(", "))));
     }
     Ok(left.is_empty())
+}
+
+/// Чистая временная папка для одной загрузки, на том же диске, что и кэш (перенос без копирования)
+fn fresh_scratch_dir() -> Result<PathBuf> {
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let dir = crate::config::data_dir().join("downloading").join(format!("{}-{}", std::process::id(), stamp));
+    std::fs::create_dir_all(&dir).context(t("не удалось создать временную папку загрузки"))?;
+    Ok(dir)
+}
+
+/// Переносит скачанные предметы из временной папки в кэш; неполный остаток прошлой попытки заменяется
+fn adopt_downloads(scratch: &Path, ids: &[String]) -> Result<()> {
+    let from_root = scratch.join("steamapps/workshop/content").join(APP_ID);
+    let to_root = cache_content();
+    std::fs::create_dir_all(&to_root)?;
+    for id in ids {
+        let from = from_root.join(id);
+        if !from.is_dir() {
+            continue;
+        }
+        let to = to_root.join(id);
+        if to.exists() {
+            std::fs::remove_dir_all(&to)?;
+        }
+        if std::fs::rename(&from, &to).is_err() {
+            copy_dir(&from, &to)?;
+        }
+    }
+    Ok(())
 }
 
 /// Убирает цветовые escape-коды терминала (SteamCMD пишет `\x1b[0m` и т.п.)
