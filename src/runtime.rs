@@ -252,12 +252,28 @@ pub fn client_plan(s: &Settings, srv: &ServerCfg, nosteam: bool, extra: &[String
     if !program.exists() {
         return None;
     }
-    let mut args = vec![format!("-cachedir={}", srv.client_cache_dir(s).display())];
+    let mut args = vec![];
+    if zombiebuddy_present(&program) {
+        // JVM arguments go before the first `--`, game arguments after it (pzexe launcher)
+        args.push("-javaagent:ZombieBuddy.jar".to_string());
+        args.push("--".to_string());
+    }
+    args.push(format!("-cachedir={}", srv.client_cache_dir(s).display()));
     if nosteam {
         args.push("-nosteam".into());
     }
     args.extend(extra.iter().cloned());
     Some(Launch { cwd: program.parent()?.to_path_buf(), program, args })
+}
+
+/// Linux: ZombieBuddy.jar next to the game's jars (where projectzomboid.sh runs the game)
+/// means mods that need ZombieBuddy are in use, so the client is started with its Java agent.
+fn zombiebuddy_present(launcher: &Path) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    let Some(dir) = launcher.parent() else { return false };
+    dir.join("projectzomboid/ZombieBuddy.jar").is_file() || dir.join("ZombieBuddy.jar").is_file()
 }
 
 fn detach(cmd: &mut Command) {
@@ -532,6 +548,25 @@ pub fn wait_ready(s: &Settings, srv: &ServerCfg, timeout: Duration) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn client_plan_adds_zombiebuddy_agent_before_game_args() {
+        let d = std::env::temp_dir().join(format!("pzmm-zb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("projectzomboid")).unwrap();
+        std::fs::write(d.join("projectzomboid.sh"), "").unwrap();
+        let mut s = Settings::default();
+        s.client_game_dir = d.clone();
+        let srv = ServerCfg::default();
+        let plain = client_plan(&s, &srv, true, &[]).unwrap();
+        assert!(plain.args[0].starts_with("-cachedir="));
+        std::fs::write(d.join("projectzomboid/ZombieBuddy.jar"), "").unwrap();
+        let zb = client_plan(&s, &srv, true, &[]).unwrap();
+        assert_eq!(&zb.args[..2], ["-javaagent:ZombieBuddy.jar", "--"]);
+        assert!(zb.args[2].starts_with("-cachedir="));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn run_dir_is_stable_and_distinct() {

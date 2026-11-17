@@ -24,6 +24,7 @@ pub fn game_args(s: &ServerCfg) -> Vec<String> {
 
 /// windows=true: напрямую java (как ProjectZomboidServer.bat), иначе start-server.sh
 pub fn plan_for(s: &ServerCfg, windows: bool) -> Option<Plan> {
+    let agent = s.mods_dir().join("ZombieBuddy/libs/ZombieBuddy.jar");
     if windows {
         let java = s.game_dir.join("jre64/bin").join("java.exe");
         if !java.exists() || !s.game_dir.join("projectzomboid.jar").exists() {
@@ -39,6 +40,9 @@ pub fn plan_for(s: &ServerCfg, windows: bool) -> Option<Plan> {
         .iter()
         .map(|x| x.to_string())
         .collect();
+        if agent.is_file() {
+            args.push(format!("-javaagent:{}", agent.display()));
+        }
         args.push(format!("-Xmx{}m", s.xmx_mb.max(1024)));
         args.push("-Djava.library.path=./natives/;./natives/win64/;./".into());
         args.push("-cp".into());
@@ -48,7 +52,15 @@ pub fn plan_for(s: &ServerCfg, windows: bool) -> Option<Plan> {
         Some(Plan { program: java, args })
     } else {
         let sh = s.game_dir.join("start-server.sh");
-        sh.exists().then(|| Plan { program: sh, args: game_args(s) })
+        sh.exists().then(|| {
+            let mut args = vec![];
+            if agent.is_file() {
+                args.push(format!("-javaagent:{}", agent.display()));
+                args.push("--".into());
+            }
+            args.extend(game_args(s));
+            Plan { program: sh, args }
+        })
     }
 }
 

@@ -150,6 +150,30 @@ fn windows_and_linux_launch_plans() {
 }
 
 #[test]
+fn server_agent_is_passed_to_jvm_before_game_arguments() {
+    let d = tmp("server agent spaces");
+    let mut c = ServerCfg::default();
+    c.game_dir = d.join("game");
+    c.cache_dir = d.join("cache");
+    std::fs::create_dir_all(c.game_dir.join("jre64/bin")).unwrap();
+    std::fs::write(c.game_dir.join("start-server.sh"), "").unwrap();
+    std::fs::write(c.game_dir.join("jre64/bin/java.exe"), "").unwrap();
+    std::fs::write(c.game_dir.join("projectzomboid.jar"), "").unwrap();
+    let jar = c.mods_dir().join("ZombieBuddy/libs/ZombieBuddy.jar");
+    std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+    std::fs::write(&jar, "").unwrap();
+    let agent = format!("-javaagent:{}", jar.display());
+    let linux = server::plan_for(&c, false).unwrap();
+    assert_eq!(linux.args[0], agent);
+    assert_eq!(linux.args[1], "--");
+    assert_eq!(linux.args[2..], server::game_args(&c));
+    let win = server::plan_for(&c, true).unwrap();
+    let agent_pos = win.args.iter().position(|a| a == &agent).unwrap();
+    let main_pos = win.args.iter().position(|a| a == "zombie.network.GameServer").unwrap();
+    assert!(agent_pos < main_pos);
+}
+
+#[test]
 fn rcon_config_from_ini_and_args() {
     let d = tmp("rcon");
     let f = d.join("pack.ini");
