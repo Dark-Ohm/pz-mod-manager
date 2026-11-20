@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 
+[workspace]
+members = ["launcher"]
+resolver = "2"
+
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
