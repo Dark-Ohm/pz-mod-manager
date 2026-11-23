@@ -276,7 +276,7 @@ fn apply_env_fields(e: &mut ServerCfg, a: &Args) -> Result<Vec<&'static str>> {
     Ok(changed)
 }
 
-fn check_unique(s: &Settings) -> Result<()> {
+pub(crate) fn check_unique(s: &Settings) -> Result<()> {
     let mut seen = HashSet::new();
     for c in &s.servers {
         if !seen.insert(c.key()) {

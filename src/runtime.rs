@@ -259,9 +259,10 @@ pub fn client_plan(s: &Settings, srv: &ServerCfg, nosteam: bool, extra: &[String
         args.push("--".to_string());
     }
     args.push(format!("-cachedir={}", srv.client_cache_dir(s).display()));
-    // Клиент всегда запускается через Steam (часы в профиле), флаг nosteam для него игнорируется.
-    let _ = nosteam;
-    args.extend(extra.iter().cloned().filter(|a| a != "-nosteam"));
+    if nosteam {
+        args.push("-nosteam".into());
+    }
+    args.extend(extra.iter().cloned());
     Some(Launch { cwd: program.parent()?.to_path_buf(), program, args })
 }
 
@@ -356,6 +357,32 @@ pub fn start_server(s: &Settings, srv: &ServerCfg, admin_password: Option<&str>)
     Ok(Started { child, launch, log })
 }
 
+/// Параметры запуска PZ, заданные в самом Steam (Свойства → Параметры запуска).
+/// Steam дописывает их после наших аргументов, и `-cachedir` оттуда перебивает выбранное окружение.
+pub fn steam_launch_conflict() -> Option<String> {
+    let base = dirs::home_dir()?.join(".local/share/Steam/userdata");
+    for u in std::fs::read_dir(base).ok()?.filter_map(|e| e.ok()) {
+        let Ok(text) = std::fs::read_to_string(u.path().join("config/localconfig.vdf")) else { continue };
+        let lines: Vec<&str> = text.lines().collect();
+        let Some(start) = lines.iter().position(|l| l.trim() == "\"108600\"") else { continue };
+        for l in lines.iter().skip(start).take(60) {
+            let mut q = l.split('"').filter(|x| !x.trim().is_empty());
+            if q.next() == Some("LaunchOptions") {
+                let v = q.next().unwrap_or("").to_string();
+                if v.contains("-cachedir") {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn which_steam() -> bool {
+    std::env::var_os("PATH").is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("steam").is_file()))
+}
+
 pub fn start_client(s: &Settings, srv: &ServerCfg, nosteam: bool, extra: &[String]) -> Result<Started> {
     let st = status(s, srv, Role::Client);
     if st.running {
@@ -370,6 +397,17 @@ pub fn start_client(s: &Settings, srv: &ServerCfg, nosteam: bool, extra: &[Strin
     {
         use std::io::Write;
         let _ = writeln!(lf, "$ {} {}", plan.program.display(), plan.args.join(" "));
+    }
+    // Всегда через клиент Steam, даже с -nosteam: Steam сам запускает игру с этими аргументами
+    // и считает часы. Если команды steam нет — запускаем игру напрямую.
+    #[cfg(unix)]
+    if which_steam() && steam_launch_conflict().is_none() {
+        let mut cmd = Command::new("steam");
+        cmd.arg("-applaunch").arg(crate::steam::APP_ID.to_string()).args(&plan.args).current_dir(&plan.cwd).stdin(Stdio::null()).stdout(lf.try_clone()?).stderr(lf);
+        detach(&mut cmd);
+        let child = cmd.spawn().context("failed to start steam")?;
+        let launch = Launch { program: PathBuf::from("steam"), args: [vec!["-applaunch".to_string(), crate::steam::APP_ID.to_string()], plan.args.clone()].concat(), cwd: plan.cwd.clone() };
+        return Ok(Started { child, launch, log });
     }
     let mut cmd = Command::new(&plan.program);
     cmd.args(&plan.args).current_dir(&plan.cwd).stdin(Stdio::null()).stdout(lf.try_clone()?).stderr(lf);

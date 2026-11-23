@@ -5,11 +5,73 @@ use crate::config::Marker;
 use crate::{App, map};
 use eframe::egui::{self, Align2, Color32, FontId, RichText, Sense, Stroke};
 
+/// Размер плитки пирамиды в пикселях; уровень L: 1 пиксель = 2^L тайлов мира
+const TILE: f32 = 256.0;
+/// Границы карты мира (клетки) из pyramid.txt ванильной Muldraugh, KY
+const TERRAIN_BOUNDS: [i32; 4] = [0, 0, 19968, 16128];
+
+/// pyramid.zip карты, которую игра показывает на клавише M (Linux: .../projectzomboid/media, Windows: .../media)
+fn find_pyramid(st: &crate::config::Settings) -> Option<std::path::PathBuf> {
+    let g = &st.client_game_dir;
+    ["projectzomboid/media/maps/Muldraugh, KY/pyramid.zip", "media/maps/Muldraugh, KY/pyramid.zip"].iter().map(|r| g.join(r)).find(|p| p.is_file())
+}
+
+/// Плитка пирамиды из zip → текстура
+fn load_tile(zip: &mut zip::ZipArchive<std::fs::File>, ctx: &egui::Context, key: (u8, u32, u32)) -> Option<egui::TextureHandle> {
+    use std::io::Read;
+    let mut f = zip.by_name(&format!("{}/tile{}x{}.png", key.0, key.1, key.2)).ok()?;
+    let mut buf = vec![];
+    f.read_to_end(&mut buf).ok()?;
+    let img = image::load_from_memory(&buf).ok()?.to_rgba8();
+    let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+    Some(ctx.load_texture(format!("tile{}_{}_{}", key.0, key.1, key.2), ci, egui::TextureOptions::LINEAR))
+}
+
+/// POIData.lua карты ПДА (BetterWorldMap, клавиша M) из модов окружения
+fn find_poi_file(srv: &crate::config::ServerCfg, st: &crate::config::Settings) -> Option<std::path::PathBuf> {
+    for root in [srv.mods_dir(), srv.client_mods_dir(st)] {
+        for e in walkdir::WalkDir::new(&root).max_depth(8).into_iter().filter_map(|e| e.ok()) {
+            if e.file_name() == "POIData.lua" && e.path().to_string_lossy().contains("BetterWorldMap") {
+                return Some(e.path().to_path_buf());
+            }
+        }
+    }
+    None
+}
+
+/// Строки вида `{ "bank", 2428, 13974 },`
+fn parse_poi(text: &str) -> Vec<(String, i32, i32)> {
+    text.lines()
+        .filter_map(|l| {
+            let l = l.trim().strip_prefix('{')?.trim_end_matches(',').trim_end_matches('}');
+            let mut it = l.split(',').map(str::trim);
+            let cat = it.next()?.trim_matches('"').to_string();
+            Some((cat, it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+        })
+        .collect()
+}
+
+fn poi_color(cat: &str) -> Color32 {
+    let h = cat.bytes().fold(7u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+    let hue = (h % 360) as f32 / 360.0;
+    let c = egui::ecolor::Hsva::new(hue, 0.55, 0.95, 1.0);
+    Color32::from(c)
+}
+
 impl App {
     pub fn tab_map(&mut self, ui: &mut egui::Ui) {
         self.refresh_players();
         let srv = self.store.settings.server().clone();
-        let [bx0, by0, bx1, by1] = srv.map_bounds;
+        let want = find_poi_file(&srv, &self.store.settings);
+        if self.map_poi.as_ref().map(|(p, _)| p) != want.as_ref() {
+            self.map_poi = want.map(|p| {
+                let pts = std::fs::read_to_string(&p).map(|t| parse_poi(&t)).unwrap_or_default();
+                (p, pts)
+            });
+        }
+        let pyramid = find_pyramid(&self.store.settings);
+        let use_terrain = self.map_terrain_on && pyramid.is_some() && srv.map_image.as_os_str().is_empty();
+        let [bx0, by0, bx1, by1] = if use_terrain { TERRAIN_BOUNDS } else { srv.map_bounds };
         let mut center: Option<(f32, f32)> = None;
         let mut add_marker: Option<(i32, i32)> = None;
         let mut del_marker: Option<usize> = None;
@@ -39,6 +101,43 @@ impl App {
                 });
             }
             ui.add(egui::TextEdit::singleline(&mut self.marker_name).hint_text(t("имя новой метки")).desired_width(f32::INFINITY));
+            ui.separator();
+            ui.heading(t("Карта ПДА (M)"));
+            if pyramid.is_some() {
+                if ui.checkbox(&mut self.map_terrain_on, t("Карта мира (как на клавише M)")).changed() {
+                    self.map_fit = true;
+                }
+            } else {
+                ui.weak(t("pyramid.zip игры не найден: проверь папку клиента игры в настройках"));
+            }
+            match &self.map_poi {
+                Some((p, pts)) => {
+                    ui.checkbox(&mut self.map_poi_on, tf!("Точки интереса: {}", pts.len())).on_hover_text(p.display().to_string());
+                    let mut cats: Vec<&str> = pts.iter().map(|(c, _, _)| c.as_str()).collect();
+                    cats.sort_unstable();
+                    cats.dedup();
+                    egui::CollapsingHeader::new(t("Категории")).id_salt("poicats").show(ui, |ui| {
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            for c in cats {
+                                let mut on = !self.map_poi_hidden.contains(c);
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(poi_color(c), "●");
+                                    if ui.checkbox(&mut on, c).changed() {
+                                        if on {
+                                            self.map_poi_hidden.remove(c);
+                                        } else {
+                                            self.map_poi_hidden.insert(c.to_string());
+                                        }
+                                    }
+                                });
+                            }
+                        });
+                    });
+                }
+                None => {
+                    ui.weak(t("Мод карты ПДА (BetterWorldMap) не найден в модах окружения"));
+                }
+            }
             ui.separator();
             ui.heading(t("Фон карты"));
             let mut cfg_changed = false;
@@ -107,6 +206,48 @@ impl App {
                 egui::Image::new(uri).paint_at(ui, r.intersect(rect.expand(4000.0)));
             }
 
+            // карта мира: пирамида плиток игры
+            if use_terrain {
+                if let Some(pz) = &pyramid {
+                    if self.map_zip.as_ref().map(|(p, _)| p) != Some(pz) {
+                        self.map_zip = std::fs::File::open(pz).ok().and_then(|f| zip::ZipArchive::new(f).ok()).map(|z| (pz.clone(), z));
+                        self.map_tiles.clear();
+                    }
+                    let level = ((1.0 / v.scale.max(0.001)).log2().floor().max(0.0) as u8).min(4);
+                    let tw = TILE * (1u32 << level) as f32;
+                    let (wx0, wy0) = v.to_world(rect, rect.min);
+                    let (wx1, wy1) = v.to_world(rect, rect.max);
+                    let (tx0, ty0) = ((wx0 / tw).floor().max(0.0) as u32, (wy0 / tw).floor().max(0.0) as u32);
+                    let (tx1, ty1) = ((wx1 / tw).floor().max(0.0) as u32, (wy1 / tw).floor().max(0.0) as u32);
+                    if self.map_tiles.len() > 600 {
+                        self.map_tiles.clear();
+                    }
+                    let mut loaded = 0;
+                    let mut pending = false;
+                    for ty in ty0..=ty1.min(63 >> level) {
+                        for tx in tx0..=tx1.min(77 >> level) {
+                            let key = (level, tx, ty);
+                            if !self.map_tiles.contains_key(&key) {
+                                if loaded >= 8 {
+                                    pending = true;
+                                    continue;
+                                }
+                                let tex = self.map_zip.as_mut().and_then(|(_, z)| load_tile(z, ui.ctx(), key));
+                                self.map_tiles.insert(key, tex);
+                                loaded += 1;
+                            }
+                            if let Some(Some(tex)) = self.map_tiles.get(&key) {
+                                let r = egui::Rect::from_two_pos(v.to_screen(rect, tx as f32 * tw, ty as f32 * tw), v.to_screen(rect, (tx + 1) as f32 * tw, (ty + 1) as f32 * tw));
+                                clip.image(tex.id(), r, egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)), Color32::WHITE);
+                            }
+                        }
+                    }
+                    if pending {
+                        ui.ctx().request_repaint();
+                    }
+                }
+            }
+
             // сетка клеток
             let step = v.grid_step();
             let (wx0, wy0) = v.to_world(rect, rect.min);
@@ -133,6 +274,26 @@ impl App {
                 gy += step;
             }
             clip.rect_stroke(egui::Rect::from_two_pos(v.to_screen(rect, bx0 as f32, by0 as f32), v.to_screen(rect, bx1 as f32, by1 as f32)), 0.0, Stroke::new(1.5, Color32::from_rgb(90, 130, 90)), egui::StrokeKind::Middle);
+
+            // точки интереса карты ПДА
+            if self.map_poi_on {
+                if let Some((_, pts)) = &self.map_poi {
+                    let labels = v.scale > 0.12;
+                    for (cat, x, y) in pts {
+                        if self.map_poi_hidden.contains(cat) {
+                            continue;
+                        }
+                        let p = v.to_screen(rect, *x as f32, *y as f32);
+                        if !rect.expand(20.0).contains(p) {
+                            continue;
+                        }
+                        clip.circle_filled(p, 3.0, poi_color(cat));
+                        if labels {
+                            clip.text(p + egui::vec2(5.0, -1.0), Align2::LEFT_CENTER, cat, FontId::proportional(10.0), Color32::from_gray(190));
+                        }
+                    }
+                }
+            }
 
             // метки
             for m in &srv.markers {

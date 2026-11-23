@@ -305,3 +305,18 @@ pub fn config_root() -> PathBuf {
     }
     dirs::config_dir().unwrap_or_default().join("pz-mod-manager")
 }
+
+/// Каждому окружению нужна своя папка данных сервера (иначе общая база мира)
+pub fn check_dirs_unique(s: &Settings) -> Result<(), String> {
+    let mut keys = std::collections::HashSet::new();
+    let mut dirs = std::collections::HashSet::new();
+    for c in &s.servers {
+        if !keys.insert(c.key()) {
+            return Err(format!("{}: {}", t("Два окружения с одним id"), c.key()));
+        }
+        if !dirs.insert(c.cache_dir.clone()) {
+            return Err(format!("{}: {}", t("Две папки данных сервера совпадают"), c.cache_dir.display()));
+        }
+    }
+    Ok(())
+}

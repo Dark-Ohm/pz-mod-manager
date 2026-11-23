@@ -7,6 +7,7 @@ use i18n::t;
 mod i18n_en;
 mod atomic;
 mod selfupdate;
+mod sync;
 mod backup;
 mod commands;
 mod config;
@@ -24,6 +25,7 @@ mod server;
 mod sort;
 mod steam;
 mod tab_backup;
+mod tab_envs;
 mod tab_map;
 mod packs;
 mod share;
@@ -106,6 +108,7 @@ enum Tab {
     Map,
     Updates,
     Packs,
+    Envs,
     Settings,
 }
 
@@ -179,6 +182,17 @@ pub struct App {
     /// раздел «Управление»: имя последнего бэкапа и когда смотрели
     pub dash_backup: Option<String>,
     pub dash_at: Option<std::time::Instant>,
+    pub sync_rep: Option<sync::Report>,
+    pub sync_open: bool,
+    pub env_sel: usize,
+    pub env_new: tab_envs::NewEnv,
+    pub env_new_open: bool,
+    pub env_del_confirm: bool,
+    pub sync_items: Vec<sync::Item>,
+    pub sync_list: bool,
+    pub rescan_pending: bool,
+    pub del_confirm: Option<String>,
+    pub cache_confirm: Option<u64>,
     /// Mods= из ini активного окружения: (файл есть, id по порядку, B42-стиль с «\»); обновляется раз в секунду
     pub ini_state: (bool, Vec<String>, bool),
     pub rt_polled: Option<std::time::Instant>,
@@ -216,6 +230,12 @@ pub struct App {
     pub map_fit: bool,
     pub marker_name: String,
     pub map_ctx: Option<(f32, f32)>,
+    pub map_poi: Option<(std::path::PathBuf, Vec<(String, i32, i32)>)>,
+    pub map_poi_on: bool,
+    pub map_terrain_on: bool,
+    pub map_zip: Option<(std::path::PathBuf, zip::ZipArchive<std::fs::File>)>,
+    pub map_tiles: HashMap<(u8, u32, u32), Option<egui::TextureHandle>>,
+    pub map_poi_hidden: HashSet<String>,
     pub shot_frames: u32,
     // обновления локальных модов
     pub tracking: tracking::Tracking,
@@ -329,6 +349,17 @@ impl App {
             ini_port: String::new(),
             dash_backup: None,
             dash_at: None,
+            sync_rep: None,
+            sync_open: false,
+            env_sel: 0,
+            env_new: tab_envs::NewEnv::default(),
+            env_new_open: false,
+            env_del_confirm: false,
+            sync_items: vec![],
+            sync_list: true,
+            rescan_pending: false,
+            del_confirm: None,
+            cache_confirm: None,
             rt_polled: None,
             srv_log: vec![],
             srv_input: String::new(),
@@ -358,6 +389,12 @@ impl App {
             map_fit: true,
             marker_name: String::new(),
             map_ctx: None,
+            map_poi: None,
+            map_poi_on: true,
+            map_terrain_on: true,
+            map_zip: None,
+            map_tiles: HashMap::new(),
+            map_poi_hidden: HashSet::new(),
             shot_frames: 0,
             tracking: tracking::Tracking::load(),
             remote: HashMap::new(),
@@ -402,6 +439,7 @@ impl App {
             Ok("map") => Tab::Map,
             Ok("updates") => Tab::Updates,
             Ok("packs") => Tab::Packs,
+            Ok("envs") => Tab::Envs,
             Ok("settings") => Tab::Settings,
             _ => Tab::Mods,
         };
@@ -481,6 +519,10 @@ impl App {
                 Bg::Cmd(t) => self.cmd_log.extend(t.lines().map(str::to_string)),
                 Bg::Job(t) => {
                     self.busy = self.busy.saturating_sub(1);
+                    if std::mem::take(&mut self.rescan_pending) {
+                        self.rescan();
+                        self.dash_at = None;
+                    }
                     self.status = t;
                     self.bk_list = backup::list(self.store.settings.server());
                 }
@@ -620,7 +662,6 @@ impl App {
     // ---------- вкладки ----------
 
     fn top_bar(&mut self, ui: &mut egui::Ui) {
-        let mut launch: Option<Launch> = None;
         let mut switch_to: Option<usize> = None;
         ui.horizontal(|ui| {
             ui.heading(RichText::new("PZ Mod Manager").color(ACCENT));
@@ -628,19 +669,7 @@ impl App {
             self.env_switcher(ui, &mut switch_to);
             ui.add_space(6.0);
             ui.label(RichText::new(self.env_summary()).color(Color32::from_gray(150)));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let green = Color32::from_rgb(70, 120, 55);
-                let more = egui::Button::new(RichText::new("▾").strong().color(Color32::WHITE)).fill(green).min_size(egui::vec2(30.0, 30.0));
-                egui::containers::menu::MenuButton::from_button(more).ui(ui, |ui| self.launch_menu(ui, &mut launch)).0.on_hover_text(t("Другие способы запуска: клиент и сервер любого окружения, со Steam или -nosteam"));
-                let play = egui::Button::new(RichText::new(t("▶  Играть")).strong().color(Color32::WHITE)).fill(green).min_size(egui::vec2(120.0, 30.0));
-                if ui.add(play).on_hover_text(t("Запустить Project Zomboid через Steam (клиент)")).clicked() {
-                    launch = Some(Launch::Steam);
-                }
-            });
         });
-        if let Some(l) = launch {
-            self.do_launch(l);
-        }
         if let Some(i) = switch_to {
             self.switch_env(i);
         }
@@ -650,7 +679,7 @@ impl App {
     fn nav(&mut self, ui: &mut egui::Ui) {
         let groups: [(String, Vec<(Tab, &str, String)>); 3] = [
             (t("Моды"), vec![(Tab::Mods, "☰", t("Моды")), (Tab::Download, "⬇", t("Загрузка")), (Tab::Updates, "⟳", t("Обновления")), (Tab::Packs, "📦", t("Сборки"))]),
-            (t("Сервер"), vec![(Tab::Server, "▶", t("Управление")), (Tab::Sandbox, "🔧", t("Песочница")), (Tab::Players, "👥", t("Игроки")), (Tab::Map, "🗺", t("Карта")), (Tab::Backup, "💾", t("Бэкапы"))]),
+            (t("Сервер"), vec![(Tab::Server, "▶", t("Управление")), (Tab::Envs, "🗂", t("Окружения")), (Tab::Sandbox, "🔧", t("Песочница")), (Tab::Players, "👥", t("Игроки")), (Tab::Map, "🗺", t("Карта")), (Tab::Backup, "💾", t("Бэкапы"))]),
             (String::new(), vec![(Tab::Settings, "⚙", t("Настройки"))]),
         ];
         ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
@@ -666,7 +695,53 @@ impl App {
                     ui.selectable_value(&mut self.tab, tab, format!("{icon}  {name}"));
                 }
             }
+            // обновление программы — внизу панели
+            let rest = ui.available_height();
+            let need = if self.self_msg.is_empty() { 44.0 } else { 70.0 };
+            if rest > need {
+                ui.add_space(rest - need);
+            }
+            ui.separator();
+            ui.weak(tf!("Версия: {}", &selfupdate::COMMIT[..selfupdate::COMMIT.len().min(7)]));
+            self.self_update_ui(ui, true);
         });
+    }
+
+    /// Кнопка обновления программы: сначала «Проверить», при новой версии — «Обновить»
+    fn self_update_ui(&mut self, ui: &mut egui::Ui, compact: bool) {
+        let newer = self.self_info.as_ref().is_some_and(|i| i.newer);
+        let draw = |app: &mut App, ui: &mut egui::Ui| {
+            if newer {
+                if ui.add_enabled(!app.self_busy, egui::Button::new(t("⬆ Обновить и перезапустить"))).clicked() {
+                    if let Some(info) = app.self_info.clone() {
+                        app.self_busy = true;
+                        app.self_msg = t("Скачиваю…").to_string();
+                        let tx = app.bg_tx.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(Bg::SelfApplied(selfupdate::apply(&info).map(|_| ()).map_err(|e| format!("{e:#}"))));
+                        });
+                    }
+                }
+            } else if ui.add_enabled(!app.self_busy, egui::Button::new(t("⟳ Проверить обновление"))).clicked() {
+                app.self_busy = true;
+                app.self_msg = t("Проверяю…").to_string();
+                let tx = app.bg_tx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(Bg::SelfCheck(selfupdate::check().map_err(|e| format!("{e:#}"))));
+                });
+            }
+        };
+        if compact {
+            draw(self, ui);
+            if !self.self_msg.is_empty() {
+                ui.add(egui::Label::new(RichText::new(&self.self_msg).size(11.5).color(if newer { ACCENT } else { Color32::from_gray(140) })).wrap());
+            }
+        } else {
+            ui.horizontal(|ui| {
+                draw(self, ui);
+                ui.label(&self.self_msg);
+            });
+        }
     }
 
     /// Цвет точки состояния сервера: готов / запускается / выключен
@@ -820,7 +895,11 @@ impl App {
         };
         self.status = match started {
             Ok((r, msg)) => {
-                let text = i18n::fill(&msg, &[&r.log.display()]);
+                let mut text = i18n::fill(&msg, &[&r.log.display()]);
+                if let (Launch::Client(..) | Launch::PlainClient, Some(o)) = (&l, runtime::steam_launch_conflict()) {
+                    text = tf!("Запущено напрямую, без Steam: в параметрах запуска PZ в Steam задано «{}», оно перебило бы окружение. Очисти их в Steam. ", o) + &text;
+                }
+                let text = text;
                 self.children.push(r.child);
                 text
             }
@@ -906,6 +985,7 @@ impl App {
 
         let mut act: Option<Act> = None;
         let mut select: Option<String> = None;
+        let mut ask_del: Option<String> = None;
         let dragging = self.drag;
         let mut drag_start: Option<usize> = None;
         let mut dropped: Option<(usize, usize)> = None;
@@ -923,6 +1003,9 @@ impl App {
                 ui.label(tf!("Источник: {}", m.source.label()));
                 if ui.button(t("📂 Открыть папку мода")).on_hover_text(m.path.display().to_string()).clicked() {
                     open_dir = Some(m.path.clone());
+                }
+                if m.source == Source::ServerLocal && ui.button(t("🗑 Удалить мод…")).on_hover_text(t("Папка уйдёт в backups/mods-removed, мод уберётся из сборки")).clicked() {
+                    ask_del = Some(m.id.clone());
                 }
                 if let Some(w) = &m.workshop_id {
                     ui.hyperlink_to(format!("Workshop {w}"), format!("https://steamcommunity.com/sharedfiles/filedetails/?id={w}"));
@@ -1000,6 +1083,14 @@ impl App {
                                 let r = ui.add(egui::Label::new(if enabled { txt.strong() } else { txt.weak() }).sense(egui::Sense::click()));
                                 if r.clicked() {
                                     select = Some(id.to_string());
+                                }
+                                if m.is_some_and(|m| m.source == Source::ServerLocal) {
+                                    r.context_menu(|ui| {
+                                        if ui.button(t("🗑 Удалить мод…")).clicked() {
+                                            ask_del = Some(id.to_string());
+                                            ui.close();
+                                        }
+                                    });
                                 }
                                 match sev {
                                     Some(Severity::Error) => {
@@ -1087,6 +1178,10 @@ impl App {
         } else if self.drag.is_some() && !ui.ctx().input(|i| i.pointer.any_down()) {
             self.drag = None;
         }
+        if ask_del.is_some() {
+            self.del_confirm = ask_del;
+        }
+        self.delete_window(ui.ctx());
         if let Some(a) = act {
             let en = &mut self.store.profile_mut().enabled;
             match a {
@@ -1101,6 +1196,60 @@ impl App {
                 Act::Down(i) => en.swap(i, i + 1),
             }
             self.save();
+        }
+    }
+
+    /// Подтверждение удаления мода из папки mods окружения
+    fn delete_window(&mut self, ctx: &egui::Context) {
+        let Some(id) = self.del_confirm.clone() else { return };
+        let srv = self.store.settings.server().clone();
+        let folder = self.installed.get(&id).and_then(|m| {
+            let rel = m.path.strip_prefix(srv.mods_dir()).ok()?;
+            Some(srv.mods_dir().join(rel.components().next()?))
+        });
+        let mut done = false;
+        let mut go = false;
+        egui::Window::new(t("Удалить мод")).collapsible(false).resizable(false).show(ctx, |ui| {
+            match &folder {
+                Some(f) => {
+                    ui.label(RichText::new(self.installed.get(&id).map(|m| m.name.as_str()).unwrap_or(&id)).strong());
+                    ui.label(tf!("Папка: {}", platform::short(f)));
+                    ui.weak(t("Папка не стирается: она переносится в backups/mods-removed окружения. Мод пропадёт из сборки."));
+                    ui.horizontal(|ui| {
+                        if ui.button(t("🗑 Удалить")).clicked() {
+                            go = true;
+                        }
+                        if ui.button(t("Отмена")).clicked() {
+                            done = true;
+                        }
+                    });
+                }
+                None => {
+                    ui.label(t("Мод не лежит в папке mods этого окружения"));
+                    if ui.button(t("Закрыть")).clicked() {
+                        done = true;
+                    }
+                }
+            }
+        });
+        if go {
+            if let Some(f) = folder {
+                let gone: Vec<String> = self.installed.values().filter(|m| m.path.starts_with(&f)).map(|m| m.id.clone()).collect();
+                self.status = match sync::move_to_trash(&srv, &f) {
+                    Ok(p) => {
+                        self.store.profile_mut().enabled.retain(|x| !gone.contains(x));
+                        self.save();
+                        self.selected = None;
+                        self.rescan();
+                        tf!("Мод убран: {}", platform::short(&p))
+                    }
+                    Err(e) => tf!("Ошибка: {}", format!("{e:#}")),
+                };
+            }
+            done = true;
+        }
+        if done {
+            self.del_confirm = None;
         }
     }
 
@@ -1146,6 +1295,9 @@ impl App {
             if ui.button(t("📂 Папка загрузок")).on_hover_text(steam::cache_content().display().to_string()).clicked() {
                 open_dir = Some(steam::cache_content());
             }
+            if ui.add_enabled(!busy, egui::Button::new(t("🧹 Очистить кеш"))).on_hover_text(t("Удалить скачанные из Steam файлы (установленные в окружения моды не затрагиваются)")).clicked() {
+                self.cache_confirm = Some(backup::dir_size(&steam::cache_dir()));
+            }
             ui.separator();
             ui.label(t("Ставить в окружение:"));
             egui::ComboBox::from_id_salt("dl_env").selected_text(envs[self.dl_env].clone()).show_ui(ui, |ui| {
@@ -1154,6 +1306,34 @@ impl App {
                 }
             });
         });
+        if let Some(size) = self.cache_confirm {
+            let mut go = false;
+            let mut cancel = false;
+            egui::Window::new(t("Очистить кеш загрузок")).collapsible(false).resizable(false).show(ui.ctx(), |ui| {
+                ui.label(tf!("Будет удалено: {} ({})", platform::short(&steam::cache_dir()), backup::human(size)));
+                ui.weak(t("Моды, уже установленные в окружения, остаются. Удалённое можно скачать заново."));
+                ui.horizontal(|ui| {
+                    if ui.button(t("🧹 Очистить")).clicked() {
+                        go = true;
+                    }
+                    if ui.button(t("Отмена")).clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+            if go {
+                let dir = steam::cache_dir();
+                self.rescan_pending = true;
+                self.bg_job(move || match std::fs::remove_dir_all(&dir) {
+                    Ok(_) => t("Кеш очищен").to_string(),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => t("Кеш уже пуст").to_string(),
+                    Err(e) => tf!("Ошибка: {}", e),
+                });
+            }
+            if go || cancel {
+                self.cache_confirm = None;
+            }
+        }
         let mut items: Vec<(String, Vec<&Mod>)> = vec![];
         for m in &self.cache {
             let w = m.workshop_id.clone().unwrap_or_default();
@@ -1309,10 +1489,84 @@ impl App {
         egui::ScrollArea::vertical().id_salt("srvtab").auto_shrink([false; 2]).show(ui, |ui| self.tab_server_inner(ui));
     }
 
+    /// Окно синхронизации: что расходится и что с этим сделать
+    fn sync_window(&mut self, ctx: &egui::Context, rep: &sync::Report, settings: &config::Settings, srv: &config::ServerCfg) {
+        if !self.sync_open {
+            return;
+        }
+        let mut open = true;
+        let mut run = false;
+        let mut close = false;
+        egui::Window::new(t("Синхронизация клиента и сервера")).open(&mut open).collapsible(false).default_width(560.0).show(ctx, |ui| {
+            ui.weak(t("Выбери для каждой папки: перенести к другой стороне, убрать (уйдёт в backups/mods-removed, не удаляется навсегда) или пропустить. Перенос не включает мод в ini."));
+            ui.horizontal(|ui| {
+                if ui.button(t("Всё перенести")).clicked() {
+                    self.sync_items.iter_mut().for_each(|i| i.act = sync::Do::Copy);
+                }
+                if ui.button(t("Всё убрать")).clicked() {
+                    self.sync_items.iter_mut().for_each(|i| i.act = sync::Do::Remove);
+                }
+                if ui.button(t("Всё пропустить")).clicked() {
+                    self.sync_items.iter_mut().for_each(|i| i.act = sync::Do::Skip);
+                }
+            });
+            ui.add_space(4.0);
+            egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
+                if self.sync_items.is_empty() {
+                    ui.weak(t("Папки совпадают"));
+                }
+                for it in self.sync_items.iter_mut() {
+                    ui.horizontal(|ui| {
+                        let (where_, to) = match it.side {
+                            sync::Side::OnlyServer => (t("только на сервере"), t("на клиент")),
+                            sync::Side::OnlyClient => (t("только у клиента"), t("на сервер")),
+                        };
+                        egui::ComboBox::from_id_salt(("sync", &it.name, it.side as u8)).width(190.0).selected_text(match it.act {
+                            sync::Do::Skip => t("Пропустить"),
+                            sync::Do::Copy => tf!("Перенести {}", to),
+                            sync::Do::Remove => t("Убрать"),
+                        }).show_ui(ui, |ui| {
+                            ui.selectable_value(&mut it.act, sync::Do::Copy, tf!("Перенести {}", to));
+                            ui.selectable_value(&mut it.act, sync::Do::Remove, t("Убрать"));
+                            ui.selectable_value(&mut it.act, sync::Do::Skip, t("Пропустить"));
+                        });
+                        ui.label(RichText::new(&it.name).strong());
+                        ui.weak(where_);
+                    });
+                }
+            });
+            ui.separator();
+            let lists_differ = !rep.missing_on_client.is_empty() || !rep.extra_on_client.is_empty() || rep.first_order_diff.is_some() || !rep.client_file_exists;
+            if lists_differ {
+                ui.checkbox(&mut self.sync_list, tf!("Записать список и порядок клиента из ini сервера ({} модов)", rep.server_count));
+            }
+            ui.horizontal(|ui| {
+                if ui.button(t("Применить")).clicked() {
+                    run = true;
+                }
+                if ui.button(t("Отмена")).clicked() {
+                    close = true;
+                }
+            });
+        });
+        if run {
+            let (s, c) = (settings.clone(), srv.clone());
+            let items = self.sync_items.clone();
+            let wl = self.sync_list;
+            self.rescan_pending = true;
+            self.bg_job(move || sync::run(&s, &c, &items, wl));
+            close = true;
+        }
+        if close || !open {
+            self.sync_open = false;
+        }
+    }
+
     fn refresh_dash(&mut self) {
         self.refresh_players();
         if self.dash_at.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(5)) {
             self.dash_backup = backup::list(self.store.settings.server()).first().map(|e| e.name.clone());
+            self.sync_rep = Some(sync::check(&self.store.settings, self.store.settings.server()));
             self.dash_at = Some(std::time::Instant::now());
         }
     }
@@ -1497,6 +1751,54 @@ impl App {
             }
         });
 
+        // ---- синхронизация клиента и сервера ----
+        ui.add_space(2.0);
+        if let Some(rep) = self.sync_rep.clone() {
+            let client_busy = self.cli_status.as_ref().is_some_and(|c| c.running);
+            let mut do_sync = false;
+            card(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new(t("Клиент и сервер")).strong());
+                    if !rep.ini_exists {
+                        ui.colored_label(DIM, t("ini сервера ещё нет"));
+                    } else if rep.in_sync() {
+                        ui.colored_label(ACCENT, tf!("✔ моды и порядок совпадают ({})", rep.server_count));
+                    } else {
+                        ui.colored_label(WARN, t("⚠ клиент и сервер не синхронизированы"));
+                        let b = ui.add_enabled(!client_busy, egui::Button::new(t("⇄ Разобраться…")));
+                        if client_busy {
+                            b.on_hover_text(t("Останови клиент: игра перезапишет список при выходе"));
+                        } else if b.on_hover_text(t("Посмотреть расхождения и выбрать, что с ними сделать")).clicked() {
+                            do_sync = true;
+                        }
+                    }
+                });
+                if rep.ini_exists && !rep.client_file_exists {
+                    ui.colored_label(WARN, tf!("Нет файла списка клиента: {}", platform::short(&rep.client_file)));
+                }
+                let list = |ui: &mut egui::Ui, title: String, v: &[String]| {
+                    if !v.is_empty() {
+                        let shown: Vec<&str> = v.iter().take(6).map(String::as_str).collect();
+                        let more = if v.len() > 6 { format!(" … +{}", v.len() - 6) } else { String::new() };
+                        ui.label(RichText::new(format!("{title} ({}): {}{more}", v.len(), shown.join(", "))).size(12.0));
+                    }
+                };
+                list(ui, t("Нет в списке клиента").to_string(), &rep.missing_on_client);
+                list(ui, t("Лишние в списке клиента").to_string(), &rep.extra_on_client);
+                list(ui, t("Папки только на сервере").to_string(), &rep.folders_only_server);
+                list(ui, t("Папки только у клиента").to_string(), &rep.folders_only_client);
+                if let Some((n, a, b)) = &rep.first_order_diff {
+                    ui.label(RichText::new(tf!("Порядок расходится с позиции {}: сервер {}, клиент {}", n, a, b)).size(12.0));
+                }
+            });
+            if do_sync {
+                self.sync_items = sync::items(&rep);
+                self.sync_list = !rep.missing_on_client.is_empty() || !rep.extra_on_client.is_empty() || rep.first_order_diff.is_some() || !rep.client_file_exists;
+                self.sync_open = true;
+            }
+            self.sync_window(ui.ctx(), &rep, &settings, &srv);
+        }
+
         // ---- клиент ----
         ui.add_space(2.0);
         let client_running = self.cli_status.as_ref().is_some_and(|c| c.running);
@@ -1538,7 +1840,7 @@ impl App {
             });
             // консоль тянется до низа окна (запас под поле ввода команды)
             let log_h = (ui.clip_rect().bottom() - ui.cursor().top() - 70.0).max(160.0);
-            egui::ScrollArea::vertical().id_salt("srvlog").stick_to_bottom(true).min_scrolled_height(log_h).max_height(log_h).auto_shrink([false, true]).show(ui, |ui| {
+            let log_out = egui::ScrollArea::vertical().id_salt("srvlog").stick_to_bottom(true).min_scrolled_height(log_h).max_height(log_h).auto_shrink([false, true]).show(ui, |ui| {
                 egui::Frame::new().fill(Color32::from_rgb(16, 18, 16)).corner_radius(6).inner_margin(8).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     if self.srv_log.is_empty() {
@@ -1549,6 +1851,10 @@ impl App {
                     }
                 });
             });
+            // колесо над консолью крутит только консоль и не передаётся странице (у каждой свой скролл)
+            if ui.rect_contains_pointer(log_out.inner_rect) {
+                ui.ctx().input_mut(|i| i.smooth_scroll_delta = egui::Vec2::ZERO);
+            }
             ui.add_enabled_ui(running, |ui| {
                 let hint = if running { t("команда серверу, Enter — отправить") } else { t("сервер выключен") };
                 let r = ui.add(egui::TextEdit::singleline(&mut self.srv_input).hint_text(hint).desired_width(f32::INFINITY));
@@ -1607,6 +1913,9 @@ impl App {
                     Ok(started) => {
                         self.children.push(started.child);
                         self.status = tf!("Клиент запускается, лог: {}", started.log.display());
+                        if let Some(o) = runtime::steam_launch_conflict() {
+                            self.status = tf!("Запущено напрямую, без Steam: в параметрах запуска PZ в Steam задано «{}», оно перебило бы окружение. Очисти их в Steam. ", o) + &self.status;
+                        }
                     }
                     Err(e) => self.status = tf!("Ошибка: {}", format!("{e:#}")),
                 }
@@ -1726,29 +2035,7 @@ impl App {
         ui.add_space(10.0);
         ui.heading(t("Обновление программы"));
         ui.weak(tf!("Версия: {}", &selfupdate::COMMIT[..selfupdate::COMMIT.len().min(7)]));
-        ui.horizontal(|ui| {
-            let newer = self.self_info.as_ref().is_some_and(|i| i.newer);
-            if newer {
-                if ui.add_enabled(!self.self_busy, egui::Button::new(t("⬆ Обновить и перезапустить"))).clicked() {
-                    if let Some(info) = self.self_info.clone() {
-                        self.self_busy = true;
-                        self.self_msg = t("Скачиваю…").to_string();
-                        let tx = self.bg_tx.clone();
-                        std::thread::spawn(move || {
-                            let _ = tx.send(Bg::SelfApplied(selfupdate::apply(&info).map(|_| ()).map_err(|e| format!("{e:#}"))));
-                        });
-                    }
-                }
-            } else if ui.add_enabled(!self.self_busy, egui::Button::new(t("⟳ Проверить обновление"))).clicked() {
-                self.self_busy = true;
-                self.self_msg = t("Проверяю…").to_string();
-                let tx = self.bg_tx.clone();
-                std::thread::spawn(move || {
-                    let _ = tx.send(Bg::SelfCheck(selfupdate::check().map_err(|e| format!("{e:#}"))));
-                });
-            }
-            ui.label(&self.self_msg);
-        });
+        self.self_update_ui(ui, false);
         if let Some(i) = self.self_info.as_ref().filter(|i| i.newer && !i.notes.is_empty()) {
             ui.weak(&i.notes);
         }
@@ -1889,6 +2176,7 @@ impl eframe::App for App {
                 Tab::Map => self.tab_map(ui),
                 Tab::Updates => self.tab_updates(ui),
                 Tab::Packs => self.tab_packs(ui),
+                Tab::Envs => self.tab_envs(ui),
                 Tab::Settings => self.tab_settings(ui),
                 Tab::Mods => {}
             });
