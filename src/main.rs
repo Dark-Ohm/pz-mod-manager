@@ -859,7 +859,7 @@ impl App {
         let q = self.filter.to_lowercase();
         let matches = |m: &Mod| q.is_empty() || m.name.to_lowercase().contains(&q) || m.id.to_lowercase().contains(&q);
 
-        let mut disabled: Vec<&Mod> = self.installed.values().filter(|m| !order.contains(&m.id) && matches(m)).collect();
+        let mut disabled: Vec<&Mod> = self.installed.values().filter(|m| !order.contains(&m.id) && m.source == mods::Source::ServerLocal && matches(m)).collect();
         disabled.sort_by_key(|m| m.name.to_lowercase());
 
         let (errs, warns) = issues.values().flatten().fold((0, 0), |(e, w), i| match i.sev {
