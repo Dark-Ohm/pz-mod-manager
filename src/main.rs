@@ -1536,7 +1536,9 @@ impl App {
                     }
                 }
             });
-            egui::ScrollArea::vertical().id_salt("srvlog").stick_to_bottom(true).max_height(260.0).auto_shrink([false, true]).show(ui, |ui| {
+            // консоль тянется до низа окна (запас под поле ввода команды)
+            let log_h = (ui.clip_rect().bottom() - ui.cursor().top() - 70.0).max(160.0);
+            egui::ScrollArea::vertical().id_salt("srvlog").stick_to_bottom(true).min_scrolled_height(log_h).max_height(log_h).auto_shrink([false, true]).show(ui, |ui| {
                 egui::Frame::new().fill(Color32::from_rgb(16, 18, 16)).corner_radius(6).inner_margin(8).show(ui, |ui| {
                     ui.set_min_width(ui.available_width());
                     if self.srv_log.is_empty() {
