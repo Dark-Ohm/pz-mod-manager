@@ -6,6 +6,7 @@ mod i18n;
 use i18n::t;
 mod i18n_en;
 mod atomic;
+mod selfupdate;
 mod backup;
 mod commands;
 mod config;
@@ -143,6 +144,10 @@ pub enum Bg {
     /// сборка установлена на клиент: пересканировать моды
     PackInstalled(String),
     Updated { ws: String, ok: bool, msg: String, baseline: Option<u64> },
+    /// проверка новой версии программы
+    SelfCheck(Result<selfupdate::Info, String>),
+    /// новая версия установлена (Ok) или нет
+    SelfApplied(Result<(), String>),
 }
 
 pub struct App {
@@ -190,6 +195,7 @@ pub struct App {
     pub sb_fields: Vec<sandbox::Field>,
     pub sb_edits: HashMap<(String, String), String>,
     pub sb_filter: String,
+    pub sb_only_changed: bool,
     pub sb_for: std::path::PathBuf,
     pub sb_status: String,
     // шаблоны
@@ -224,6 +230,9 @@ pub struct App {
     pub upd_confirm: Option<String>,
     pub upd_pin_confirm: bool,
     pub upd_log: Vec<String>,
+    pub self_info: Option<selfupdate::Info>,
+    pub self_busy: bool,
+    pub self_msg: String,
     pub link_input: HashMap<String, String>,
     pub scan_links: HashMap<String, String>,
     pub proposals: Vec<matching::Proposal>,
@@ -332,6 +341,7 @@ impl App {
             sb_fields: vec![],
             sb_edits: HashMap::new(),
             sb_filter: String::new(),
+            sb_only_changed: false,
             sb_for: Default::default(),
             sb_status: String::new(),
             tpl_confirm: None,
@@ -361,6 +371,9 @@ impl App {
             upd_confirm: None,
             upd_pin_confirm: false,
             upd_log: vec![],
+            self_info: None,
+            self_busy: false,
+            self_msg: String::new(),
             link_input: HashMap::new(),
             scan_links: HashMap::new(),
             proposals: vec![],
@@ -509,6 +522,30 @@ impl App {
                             self.proposals = p;
                         }
                         Err(e) => self.status = tf!("Подбор не удался: {}", e),
+                    }
+                }
+                Bg::SelfCheck(r) => {
+                    self.self_busy = false;
+                    match r {
+                        Ok(i) => {
+                            self.self_msg = if i.newer { tf!("Есть новая версия {}", &i.sha[..i.sha.len().min(7)]) } else { t("Установлена последняя версия") };
+                            self.self_info = Some(i);
+                        }
+                        Err(e) => self.self_msg = format!("✘ {e}"),
+                    }
+                }
+                Bg::SelfApplied(r) => {
+                    self.self_busy = false;
+                    match r {
+                        Ok(()) => {
+                            if let Ok(exe) = std::env::current_exe() {
+                                if std::process::Command::new(exe).spawn().is_ok() {
+                                    std::process::exit(0);
+                                }
+                            }
+                            self.self_msg = t("Обновлено, перезапусти программу").to_string();
+                        }
+                        Err(e) => self.self_msg = format!("✘ {e}"),
                     }
                 }
                 Bg::Updated { ws, ok, msg, baseline } => {
@@ -1684,6 +1721,35 @@ impl App {
         }
         ui.add_space(8.0);
         ui.weak(tf!("SteamCMD и кэш загрузок: {}", platform::short(&config::data_dir())));
+        ui.add_space(10.0);
+        ui.heading(t("Обновление программы"));
+        ui.weak(tf!("Версия: {}", &selfupdate::COMMIT[..selfupdate::COMMIT.len().min(7)]));
+        ui.horizontal(|ui| {
+            let newer = self.self_info.as_ref().is_some_and(|i| i.newer);
+            if newer {
+                if ui.add_enabled(!self.self_busy, egui::Button::new(t("⬆ Обновить и перезапустить"))).clicked() {
+                    if let Some(info) = self.self_info.clone() {
+                        self.self_busy = true;
+                        self.self_msg = t("Скачиваю…").to_string();
+                        let tx = self.bg_tx.clone();
+                        std::thread::spawn(move || {
+                            let _ = tx.send(Bg::SelfApplied(selfupdate::apply(&info).map(|_| ()).map_err(|e| format!("{e:#}"))));
+                        });
+                    }
+                }
+            } else if ui.add_enabled(!self.self_busy, egui::Button::new(t("⟳ Проверить обновление"))).clicked() {
+                self.self_busy = true;
+                self.self_msg = t("Проверяю…").to_string();
+                let tx = self.bg_tx.clone();
+                std::thread::spawn(move || {
+                    let _ = tx.send(Bg::SelfCheck(selfupdate::check().map_err(|e| format!("{e:#}"))));
+                });
+            }
+            ui.label(&self.self_msg);
+        });
+        if let Some(i) = self.self_info.as_ref().filter(|i| i.newer && !i.notes.is_empty()) {
+            ui.weak(&i.notes);
+        }
         ui.add_space(10.0);
         ui.heading("Language / Язык");
         {

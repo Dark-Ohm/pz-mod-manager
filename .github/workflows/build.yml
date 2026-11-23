@@ -60,3 +60,25 @@ jobs:
           files: |
             ${{ matrix.manager_asset }}
             ${{ matrix.launcher_asset }}
+
+  # Каждый пуш в master пересоздаёт сборку «nightly»: из неё берёт обновление кнопка в программе.
+  # Первая строка описания `commit: <sha>` сравнивается с коммитом, вшитым в запущенный файл.
+  nightly:
+    needs: build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bin
+          merge-multiple: true
+      - name: Publish nightly
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          MSG: ${{ github.event.head_commit.message }}
+        run: |
+          gh release delete nightly --cleanup-tag -y --repo "$REPO" || true
+          printf 'commit: %s\n%s\n' "$SHA" "$MSG" > notes.txt
+          gh release create nightly --prerelease --target "$SHA" --title nightly --notes-file notes.txt --repo "$REPO" bin/*
