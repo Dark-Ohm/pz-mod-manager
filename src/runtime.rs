@@ -259,10 +259,9 @@ pub fn client_plan(s: &Settings, srv: &ServerCfg, nosteam: bool, extra: &[String
         args.push("--".to_string());
     }
     args.push(format!("-cachedir={}", srv.client_cache_dir(s).display()));
-    if nosteam {
-        args.push("-nosteam".into());
-    }
-    args.extend(extra.iter().cloned());
+    // Клиент всегда запускается через Steam (часы в профиле), флаг nosteam для него игнорируется.
+    let _ = nosteam;
+    args.extend(extra.iter().cloned().filter(|a| a != "-nosteam"));
     Some(Launch { cwd: program.parent()?.to_path_buf(), program, args })
 }
 
