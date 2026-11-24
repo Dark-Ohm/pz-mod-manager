@@ -11,8 +11,6 @@ A manager for Project Zomboid servers, game clients and mods: one binary with a 
 
 Download a ready build from [Releases](https://github.com/Dark-Ohm/pz-mod-manager/releases): `pz-mod-manager-windows-x64.exe` or `pz-mod-manager-linux-x64`.
 
-The same release carries `pz-launcher-windows-x64.exe` and `pz-launcher-linux-x64`: a small tactical launcher for a `.pzpack` mod pack. Put it in the same folder as the manager.
-
 Or build from source: `scripts\install.bat` on Windows, `scripts/install.sh` on Linux (installs Rust and system packages, then builds `target/release/pz-mod-manager`).
 
 ## Use it
@@ -25,7 +23,7 @@ Or build from source: `scripts\install.bat` on Windows, `scripts/install.sh` on 
 
 ---
 
-Менеджер серверов, клиентов и модов Project Zomboid: окно для человека, команды с JSON-ответом и MCP-сервер для ИИ-агентов. Готовые сборки лежат в [Releases](https://github.com/Dark-Ohm/pz-mod-manager/releases), там же — лаунчер сборки `pz-launcher-windows-x64.exe` (и Linux-версия); положи его рядом с менеджером. Получил от друга файл `.pzpack` — открой его в «Сборки» → «Открыть .pzpack…».
+Менеджер серверов, клиентов и модов Project Zomboid: окно для человека, команды с JSON-ответом и MCP-сервер для ИИ-агентов. Готовые сборки лежат в [Releases](https://github.com/Dark-Ohm/pz-mod-manager/releases). Получил от друга файл `.pzpack` — открой его в «Сборки» → «Открыть .pzpack…».
 
 ## License
 

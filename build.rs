@@ -5,6 +5,12 @@ fn main() {
         o.status.success().then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
     });
     println!("cargo:rustc-env=PZ_COMMIT={}", sha.unwrap_or_else(|| "unknown".into()));
-    println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-env-changed=GITHUB_SHA");
+    // `.git/HEAD` при новых коммитах не меняется (там `ref: refs/heads/master`), поэтому следим
+    // и за файлом самой ветки, иначе локальная сборка застревает на старом коммите.
+    println!("cargo:rerun-if-changed=.git/HEAD");
+    println!("cargo:rerun-if-changed=.git/packed-refs");
+    if let Some(r) = std::fs::read_to_string(".git/HEAD").ok().and_then(|h| h.trim().strip_prefix("ref: ").map(str::to_string)) {
+        println!("cargo:rerun-if-changed=.git/{r}");
+    }
 }

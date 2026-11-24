@@ -3054,21 +3054,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
-name = "pz-launcher"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "chrono",
- "dirs",
- "eframe",
- "rfd",
- "serde",
- "serde_json",
- "sha2",
- "ureq",
-]
-
-[[package]]
 name = "pz-mod-manager"
 version = "0.1.0"
 dependencies = [

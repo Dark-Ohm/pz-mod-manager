@@ -31,6 +31,7 @@ mod packs;
 mod share;
 mod tab_packs;
 mod tab_players;
+mod tab_problems;
 mod tab_share;
 mod tab_updates;
 mod tab_sandbox;
@@ -109,6 +110,7 @@ enum Tab {
     Updates,
     Packs,
     Envs,
+    Problems,
     Settings,
 }
 
@@ -156,7 +158,7 @@ pub enum Bg {
 pub struct App {
     pub store: Store,
     pub installed: HashMap<String, Mod>,
-    pub dups: HashSet<String>,
+    pub dups: HashMap<String, Vec<String>>,
     pub cache: Vec<Mod>,
     pub tab: Tab,
     pub filter: String,
@@ -274,6 +276,22 @@ pub struct App {
     pub last_changelog_req: Option<std::time::Instant>,
     pub matching: Option<(usize, usize)>,
     pub match_cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    // вкладка «Проблемы»
+    /// всё, что не в порядке (обновляется каждый кадр) и его счётчики (ошибки, предупреждения)
+    pub problems: Vec<tab_problems::Problem>,
+    pub pb_counts: (usize, usize),
+    pub pb_view: tab_problems::View,
+    pub pb_level: tab_problems::Level,
+    pub pb_filter: String,
+    pub pb_log: Vec<String>,
+    pub pb_polled: Option<std::time::Instant>,
+    /// журнал программы: (время, сообщение строки статуса)
+    pub journal: Vec<(String, String)>,
+    pub journal_last: String,
+    /// параметры запуска игры в Steam с -cachedir (см. runtime::steam_launch_conflict) и когда проверяли
+    pub steam_conflict: Option<String>,
+    pub steam_conflict_at: Option<std::time::Instant>,
+    pub sync_polled: Option<std::time::Instant>,
 }
 
 fn main() -> eframe::Result {
@@ -328,7 +346,7 @@ impl App {
         let mut a = Self {
             store: Store::load(),
             installed: HashMap::new(),
-            dups: HashSet::new(),
+            dups: HashMap::new(),
             cache: vec![],
             tab: Tab::Mods,
             filter: String::new(),
@@ -429,6 +447,18 @@ impl App {
             last_changelog_req: None,
             matching: None,
             match_cancel: Default::default(),
+            problems: vec![],
+            pb_counts: (0, 0),
+            pb_view: Default::default(),
+            pb_level: Default::default(),
+            pb_filter: String::new(),
+            pb_log: vec![],
+            pb_polled: None,
+            journal: vec![],
+            journal_last: String::new(),
+            steam_conflict: None,
+            steam_conflict_at: None,
+            sync_polled: None,
         };
         a.tab = match std::env::var("PZMM_TAB").as_deref() {
             Ok("download") => Tab::Download,
@@ -440,8 +470,15 @@ impl App {
             Ok("updates") => Tab::Updates,
             Ok("packs") => Tab::Packs,
             Ok("envs") => Tab::Envs,
+            Ok("problems" | "journal" | "serverlog" | "clientlog") => Tab::Problems,
             Ok("settings") => Tab::Settings,
             _ => Tab::Mods,
+        };
+        a.pb_view = match std::env::var("PZMM_TAB").as_deref() {
+            Ok("journal") => tab_problems::View::Journal,
+            Ok("serverlog") => tab_problems::View::Server,
+            Ok("clientlog") => tab_problems::View::Client,
+            _ => tab_problems::View::Problems,
         };
         a.dl_env = a.store.settings.active_server;
         a.rescan();
@@ -641,6 +678,16 @@ impl App {
         self.srv_status = Some(st);
         self.cli_status = Some(cl);
         self.refresh_ini();
+        // для счётчика проблем: сверка клиента с сервером и параметры запуска Steam, не на каждый кадр
+        let due = |at: Option<std::time::Instant>, secs: u64| at.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(secs));
+        if due(self.sync_polled, 10) {
+            self.sync_rep = Some(sync::check(&self.store.settings, self.store.settings.server()));
+            self.sync_polled = Some(std::time::Instant::now());
+        }
+        if due(self.steam_conflict_at, 30) {
+            self.steam_conflict = runtime::steam_launch_conflict();
+            self.steam_conflict_at = Some(std::time::Instant::now());
+        }
     }
 
     fn refresh_ini(&mut self) {
@@ -680,30 +727,40 @@ impl App {
         let groups: [(String, Vec<(Tab, &str, String)>); 3] = [
             (t("Моды"), vec![(Tab::Mods, "☰", t("Моды")), (Tab::Download, "⬇", t("Загрузка")), (Tab::Updates, "⟳", t("Обновления")), (Tab::Packs, "📦", t("Сборки"))]),
             (t("Сервер"), vec![(Tab::Server, "▶", t("Управление")), (Tab::Envs, "🗂", t("Окружения")), (Tab::Sandbox, "🔧", t("Песочница")), (Tab::Players, "👥", t("Игроки")), (Tab::Map, "🗺", t("Карта")), (Tab::Backup, "💾", t("Бэкапы"))]),
-            (String::new(), vec![(Tab::Settings, "⚙", t("Настройки"))]),
+            (String::new(), vec![(Tab::Problems, "⚠", t("Проблемы")), (Tab::Settings, "⚙", t("Настройки"))]),
         ];
-        ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-            ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for (title, items) in groups {
-                ui.add_space(10.0);
-                if !title.is_empty() {
-                    ui.label(RichText::new(title).size(11.5).color(Color32::from_gray(120)));
-                    ui.add_space(2.0);
+        let (pb_errs, pb_warns) = self.pb_counts;
+        // обновление программы закреплено внизу и видно всегда; пункты меню над ним прокручиваются в низком окне
+        egui::Panel::bottom("nav_update").resizable(false).show_separator_line(false).show_inside(ui, |ui| {
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
+                ui.separator();
+                ui.weak(tf!("Версия: {}", &selfupdate::COMMIT[..selfupdate::COMMIT.len().min(7)]));
+                self.self_update_ui(ui, true);
+                ui.add_space(4.0);
+            });
+        });
+        egui::ScrollArea::vertical().id_salt("nav_items").auto_shrink([false, false]).show(ui, |ui| {
+            ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                ui.spacing_mut().button_padding = egui::vec2(10.0, 6.0);
+                ui.spacing_mut().item_spacing.y = 2.0;
+                for (title, items) in groups {
+                    ui.add_space(10.0);
+                    if !title.is_empty() {
+                        ui.label(RichText::new(title).size(11.5).color(Color32::from_gray(120)));
+                        ui.add_space(2.0);
+                    }
+                    for (tab, icon, name) in items {
+                        if tab == Tab::Problems && pb_errs + pb_warns > 0 {
+                            // число проблем рядом с названием: красное при ошибках, жёлтое при предупреждениях
+                            let c = if pb_errs > 0 { ERR } else { WARN };
+                            ui.selectable_value(&mut self.tab, tab, RichText::new(format!("{icon}  {name}  ·  {}", pb_errs + pb_warns)).color(c));
+                        } else {
+                            ui.selectable_value(&mut self.tab, tab, format!("{icon}  {name}"));
+                        }
+                    }
                 }
-                for (tab, icon, name) in items {
-                    ui.selectable_value(&mut self.tab, tab, format!("{icon}  {name}"));
-                }
-            }
-            // обновление программы — внизу панели
-            let rest = ui.available_height();
-            let need = if self.self_msg.is_empty() { 44.0 } else { 70.0 };
-            if rest > need {
-                ui.add_space(rest - need);
-            }
-            ui.separator();
-            ui.weak(tf!("Версия: {}", &selfupdate::COMMIT[..selfupdate::COMMIT.len().min(7)]));
-            self.self_update_ui(ui, true);
+            });
         });
     }
 
@@ -712,7 +769,7 @@ impl App {
         let newer = self.self_info.as_ref().is_some_and(|i| i.newer);
         let draw = |app: &mut App, ui: &mut egui::Ui| {
             if newer {
-                if ui.add_enabled(!app.self_busy, egui::Button::new(t("⬆ Обновить и перезапустить"))).clicked() {
+                if ui.add_enabled(!app.self_busy, egui::Button::new(t("⬆ Обновить и перезапустить")).wrap()).clicked() {
                     if let Some(info) = app.self_info.clone() {
                         app.self_busy = true;
                         app.self_msg = t("Скачиваю…").to_string();
@@ -722,7 +779,7 @@ impl App {
                         });
                     }
                 }
-            } else if ui.add_enabled(!app.self_busy, egui::Button::new(t("⟳ Проверить обновление"))).clicked() {
+            } else if ui.add_enabled(!app.self_busy, egui::Button::new(t("⟳ Проверить обновление")).wrap()).clicked() {
                 app.self_busy = true;
                 app.self_msg = t("Проверяю…").to_string();
                 let tx = app.bg_tx.clone();
@@ -817,6 +874,8 @@ impl App {
         self.rt_polled = None;
         self.pl_loaded = None;
         self.dash_at = None;
+        self.sync_polled = None;
+        self.pb_polled = None;
         self.poll_server();
         self.status = tf!("Окружение: {}", self.store.settings.server().label);
     }
@@ -942,19 +1001,7 @@ impl App {
                 self.rescan();
             }
             if ui.button(t("⇅ Авто-порядок")).on_hover_text(t("Зависимости (require=) встанут выше зависящих от них модов")).clicked() {
-                let cur = self.store.profile().enabled.clone();
-                let (sorted, warns) = sort::smart_sort(&cur, &self.installed);
-                if sorted != cur {
-                    self.undo_order = Some(cur);
-                    self.store.profile_mut().enabled = sorted;
-                    self.save();
-                    self.status = t("Порядок отсортирован по зависимостям").into();
-                } else {
-                    self.status = t("Порядок уже правильный").into();
-                }
-                if !warns.is_empty() {
-                    self.status = warns.join("; ");
-                }
+                self.auto_order();
             }
             if self.undo_order.is_some() && ui.button(t("↶ Отменить")).clicked() {
                 if let Some(o) = self.undo_order.take() {
@@ -963,6 +1010,23 @@ impl App {
                 }
             }
         });
+    }
+
+    /// Зависимости (`require=`) встают выше зависящих от них модов; прежний порядок можно вернуть кнопкой «Отменить»
+    fn auto_order(&mut self) {
+        let cur = self.store.profile().enabled.clone();
+        let (sorted, warns) = sort::smart_sort(&cur, &self.installed);
+        if sorted != cur {
+            self.undo_order = Some(cur);
+            self.store.profile_mut().enabled = sorted;
+            self.save();
+            self.status = t("Порядок отсортирован по зависимостям").into();
+        } else {
+            self.status = t("Порядок уже правильный").into();
+        }
+        if !warns.is_empty() {
+            self.status = warns.join("; ");
+        }
     }
 
     fn tab_mods(&mut self, ui: &mut egui::Ui) {
@@ -1030,11 +1094,24 @@ impl App {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(tf!("Включено: {}", order.len()));
+                // счётчики ведут во вкладку «Проблемы»: там видно, какие именно моды и что с ними
+                let mut open_problems = false;
+                let mut counter = |ui: &mut egui::Ui, c: Color32, text: String| {
+                    let r = ui.add(egui::Label::new(RichText::new(text).color(c).underline()).sense(egui::Sense::click())).on_hover_text(t("Показать, что именно не так"));
+                    if r.hovered() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    open_problems |= r.clicked();
+                };
                 if errs > 0 {
-                    ui.colored_label(ERR, tf!("⛔ ошибок: {}", errs));
+                    counter(ui, ERR, tf!("⛔ ошибок: {}", errs));
                 }
                 if warns > 0 {
-                    ui.colored_label(WARN, tf!("⚠ предупреждений: {}", warns));
+                    counter(ui, WARN, tf!("⚠ предупреждений: {}", warns));
+                }
+                if open_problems {
+                    self.pb_view = tab_problems::View::Problems;
+                    self.tab = Tab::Problems;
                 }
                 if errs == 0 && warns == 0 && !order.is_empty() {
                     ui.colored_label(ACCENT, t("✔ конфликтов нет"));
@@ -1092,14 +1169,11 @@ impl App {
                                         }
                                     });
                                 }
-                                match sev {
-                                    Some(Severity::Error) => {
-                                        ui.colored_label(ERR, "⛔");
-                                    }
-                                    Some(Severity::Warn) => {
-                                        ui.colored_label(WARN, "⚠");
-                                    }
-                                    None => {}
+                                if let Some(sev) = sev {
+                                    let (c, ic) = if sev == Severity::Error { (ERR, "⛔") } else { (WARN, "⚠") };
+                                    // что именно не так — во всплывающей подсказке
+                                    let why = list.map(|l| l.iter().map(|i| i.msg.as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
+                                    ui.colored_label(c, ic).on_hover_text(why);
                                 }
                                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                     if let Some(i) = idx {
@@ -2131,6 +2205,9 @@ impl eframe::App for App {
         self.poll_server();
         self.poll_bg();
         self.poll_share();
+        self.record_status();
+        self.problems = self.collect_problems();
+        self.pb_counts = tab_problems::counts(&self.problems);
         if self.dl_rx.is_some() || self.busy > 0 || matches!(self.tab, Tab::Players | Tab::Map) {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         } else {
@@ -2144,23 +2221,35 @@ impl eframe::App for App {
             ui.add_space(6.0);
         });
         egui::Panel::bottom("status").show_inside(ui, |ui| {
-            let order = &self.store.profile().enabled;
-            let issues = mods::check(order, &self.installed, &self.dups);
-            let (errs, warns) = issues.values().flatten().fold((0, 0), |(e, w), i| if i.sev == Severity::Error { (e + 1, w) } else { (e, w + 1) });
+            let order_len = self.store.profile().enabled.len();
+            let (errs, warns) = self.pb_counts;
+            let mut open_problems = false;
             ui.horizontal(|ui| {
                 ui.label(RichText::new(&self.status).weak());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // счётчики за всё сразу (моды, ini, клиент и сервер); по клику — вкладка «Проблемы»
+                    let mut counter = |ui: &mut egui::Ui, c: Color32, text: String| {
+                        let r = ui.add(egui::Label::new(RichText::new(text).color(c)).sense(egui::Sense::click())).on_hover_text(t("Открыть вкладку «Проблемы»"));
+                        if r.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
+                        open_problems |= r.clicked();
+                    };
                     if errs > 0 {
-                        ui.colored_label(ERR, tf!("⛔ ошибок: {}", errs));
+                        counter(ui, ERR, tf!("⛔ ошибок: {}", errs));
                     }
                     if warns > 0 {
-                        ui.colored_label(WARN, tf!("⚠ предупреждений: {}", warns));
+                        counter(ui, WARN, tf!("⚠ предупреждений: {}", warns));
                     }
-                    ui.label(RichText::new(tf!("{} · сборка «{}» · модов: {}", self.store.settings.server().label, self.store.profile().name, order.len())).color(DIM));
+                    ui.label(RichText::new(tf!("{} · сборка «{}» · модов: {}", self.store.settings.server().label, self.store.profile().name, order_len)).color(DIM));
                 });
             });
+            if open_problems {
+                self.pb_view = tab_problems::View::Problems;
+                self.tab = Tab::Problems;
+            }
         });
-        egui::Panel::left("nav").resizable(false).exact_size(168.0).show_inside(ui, |ui| self.nav(ui));
+        egui::Panel::left("nav").resizable(false).exact_size(184.0).show_inside(ui, |ui| self.nav(ui));
 
         self.share_window(ui.ctx());
         let tab = self.tab;
@@ -2177,6 +2266,7 @@ impl eframe::App for App {
                 Tab::Updates => self.tab_updates(ui),
                 Tab::Packs => self.tab_packs(ui),
                 Tab::Envs => self.tab_envs(ui),
+                Tab::Problems => self.tab_problems(ui),
                 Tab::Settings => self.tab_settings(ui),
                 Tab::Mods => {}
             });
@@ -2313,7 +2403,7 @@ mod tests {
         inst.insert("lib".into(), fake("lib", &[]));
         inst.insert("addon".into(), fake("addon", &["lib", "ghost"]));
         let order = vec!["addon".to_string(), "lib".to_string()];
-        let issues = mods::check(&order, &inst, &HashSet::new());
+        let issues = mods::check(&order, &inst, &HashMap::new());
         let msgs: Vec<_> = issues["addon"].iter().map(|i| i.msg.clone()).collect();
         assert!(msgs.iter().any(|m| m.contains("ghost")), "{msgs:?}");
         assert!(msgs.iter().any(|m| m.contains("выше")), "{msgs:?}");
@@ -2412,7 +2502,7 @@ mod tests {
         let inst: HashMap<String, Mod> = found.into_iter().map(|m| (m.id.clone(), m)).collect();
         println!("ini Mods= {} ids, {} not found on disk", ids.len(), ids.iter().filter(|i| !inst.contains_key(*i)).count());
         println!("missing: {:?}", ids.iter().filter(|i| !inst.contains_key(*i)).take(10).collect::<Vec<_>>());
-        let issues = mods::check(&ids, &inst, &HashSet::new());
+        let issues = mods::check(&ids, &inst, &HashMap::new());
         let (e, w) = issues.values().flatten().fold((0, 0), |(e, w), i| if i.sev == Severity::Error { (e + 1, w) } else { (e, w + 1) });
         println!("conflict check: {e} errors, {w} warnings");
         let (m, ws) = export::build(&ids, &inst, true, bs);

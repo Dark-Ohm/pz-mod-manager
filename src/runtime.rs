@@ -127,17 +127,39 @@ fn pids_with_cachedir(cache_dir: &Path) -> Vec<u32> {
             continue;
         }
         let Ok(raw) = std::fs::read(e.path().join("cmdline")) else { continue };
-        let hit = raw.split(|b| *b == 0).any(|a| {
-            let a = String::from_utf8_lossy(a);
+        let args: Vec<String> = raw.split(|b| *b == 0).filter(|a| !a.is_empty()).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+        let hit = args.iter().any(|a| {
             let a = a.trim_end_matches('/');
             want.iter().any(|w| a == w.trim_end_matches('/'))
         });
-        if hit {
-            out.push(pid);
+        if !hit {
+            continue;
         }
+        let exe = std::fs::read_link(e.path().join("exe")).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let comm = std::fs::read_to_string(e.path().join("comm")).unwrap_or_default();
+        if is_steam_process(if exe.is_empty() { comm.trim() } else { &exe }, &args) {
+            continue;
+        }
+        out.push(pid);
     }
     out.sort();
     out
+}
+
+/// Процесс самого Steam или его обвязки (steam.sh, pressure-vessel, reaper, srt-*).
+/// Если Steam поднят командой `steam -applaunch … -cachedir=…`, этот аргумент висит и на всём
+/// дереве Steam. Такие процессы не считаются клиентом игры и не должны получать сигналы:
+/// «Закрыть клиент» гасит только игру.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_steam_process(exe: &str, args: &[String]) -> bool {
+    let base = |p: &str| p.rsplit(['/', '\\']).next().unwrap_or(p).to_ascii_lowercase();
+    let exe = base(exe);
+    const PREFIXES: [&str; 6] = ["steam", "srt-", "pv-", "reaper", "x86_64-linux-gnu-srt", "i386-linux-gnu-srt"];
+    if PREFIXES.iter().any(|p| exe.starts_with(p)) {
+        return true;
+    }
+    // `bash …/steam.sh -applaunch …`: сам скрипт запуска Steam
+    args.iter().take(3).any(|a| matches!(base(a).as_str(), "steam.sh" | "steam"))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -603,6 +625,32 @@ mod tests {
         assert_eq!(&zb.args[..2], ["-javaagent:ZombieBuddy.jar", "--"]);
         assert!(zb.args[2].starts_with("-cachedir="));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Реальное дерево процессов, когда Steam запущен менеджером: `-cachedir=` есть и у Steam,
+    /// и у игры, но сигналы должна получать только игра.
+    #[test]
+    fn steam_process_tree_is_not_the_client() {
+        let args = |s: &str| s.split(' ').map(String::from).collect::<Vec<_>>();
+        let cd = "-cachedir=/x/pz-lab-client";
+        let steam_args = args(&format!("/h/.local/share/Steam/steamrt64/steam -srt-logger-opened -applaunch 108600 -- {cd} -nosteam"));
+        assert!(is_steam_process("/home/neo/.local/share/Steam/steamrt64/steam", &steam_args));
+        assert!(is_steam_process("/usr/bin/bash", &args(&format!("bash /h/.local/share/Steam/steam.sh -applaunch 108600 -- {cd}"))));
+        for exe in [
+            "/h/.local/share/Steam/steamrt64/reaper",
+            "/h/.local/share/Steam/steamrt64/pv-runtime/pressure-vessel/libexec/steam-runtime-tools-0/srt-bwrap",
+            "/usr/lib/pressure-vessel/from-host/libexec/steam-runtime-tools-0/pv-adverb",
+            "/usr/bin/steam-runtime-launch-client",
+            "/h/.local/share/Steam/steamrt64/pv-runtime/steam-runtime-steamrt/pressure-vessel/bin/steam-runtime-supervisor",
+        ] {
+            assert!(is_steam_process(exe, &args(cd)), "{exe}");
+        }
+        // сама игра и её скрипт запуска, обычная и из Steam-папки, и сервер
+        assert!(!is_steam_process("/h/.local/share/Steam/steamapps/common/ProjectZomboid/projectzomboid/ProjectZomboid64", &args(&format!("./ProjectZomboid64 -- {cd}"))));
+        assert!(!is_steam_process("/usr/bin/bash", &args(&format!("/bin/bash /h/.local/share/Steam/steamapps/common/ProjectZomboid/projectzomboid.sh -- {cd}"))));
+        assert!(!is_steam_process("/usr/bin/java", &args(&format!("java -Xmx8g zombie.network.GameServer {cd}"))));
+        assert!(!is_steam_process("/usr/bin/sh", &args(&format!("sh -c script sh {cd}"))));
+        assert!(!is_steam_process("C:\\Games\\ProjectZomboid64.exe", &args(cd)));
     }
 
     #[test]

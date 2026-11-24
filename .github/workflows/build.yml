@@ -1,6 +1,7 @@
-# Builds and tests on Windows and Linux. Every run keeps both binaries as artifacts;
-# a tag like v0.1.1 publishes the manager and the launcher as a GitHub release,
-# so players do not need Rust.
+# Builds and tests on Windows and Linux. Every run keeps the binary as an artifact;
+# a tag like v0.2.0 publishes it as a GitHub release, so players do not need Rust.
+# The build scripts (scripts/*.bat, scripts/*.sh) are run for real on each OS, so a broken
+# script shows up here and not on a player's machine.
 name: build
 on:
   push:
@@ -21,13 +22,9 @@ jobs:
           - os: windows-latest
             manager_bin: pz-mod-manager.exe
             manager_asset: pz-mod-manager-windows-x64.exe
-            launcher_bin: pz-launcher.exe
-            launcher_asset: pz-launcher-windows-x64.exe
           - os: ubuntu-latest
             manager_bin: pz-mod-manager
             manager_asset: pz-mod-manager-linux-x64
-            launcher_bin: pz-launcher
-            launcher_asset: pz-launcher-linux-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -42,24 +39,42 @@ jobs:
       # were enough for one test to read the other's broken fixture.
       - run: cargo test --release --workspace -- --test-threads=1
       - run: cargo build --release --workspace
-      - name: Collect binaries
-        shell: bash
+
+      # The scripts a person runs by hand. The runner already has Visual Studio and Rust, so
+      # install.bat must pass without winget (it needs winget only for what is missing).
+      - name: Windows scripts (install.bat --deps-only, build.bat, run the CLI)
+        if: runner.os == 'Windows'
+        shell: cmd
+        timeout-minutes: 20
         run: |
-          cp "target/release/${{ matrix.manager_bin }}" "${{ matrix.manager_asset }}"
-          cp "target/release/${{ matrix.launcher_bin }}" "${{ matrix.launcher_asset }}"
+          call scripts\install.bat --deps-only
+          if errorlevel 1 exit /b 1
+          call scripts\build.bat
+          if errorlevel 1 exit /b 1
+          if not exist target\release\pz-mod-manager.exe exit /b 1
+          target\release\pz-mod-manager.exe version
+          if errorlevel 1 exit /b 1
+          target\release\pz-mod-manager.exe help
+      - name: Linux scripts (build.sh, run the CLI)
+        if: runner.os == 'Linux'
+        run: |
+          ./scripts/build.sh
+          ./target/release/pz-mod-manager version
+          ./target/release/pz-mod-manager help > /dev/null
+
+      - name: Collect binary
+        shell: bash
+        run: cp "target/release/${{ matrix.manager_bin }}" "${{ matrix.manager_asset }}"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.os }}-binaries
-          path: |
-            ${{ matrix.manager_asset }}
-            ${{ matrix.launcher_asset }}
+          path: ${{ matrix.manager_asset }}
       - name: Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            ${{ matrix.manager_asset }}
-            ${{ matrix.launcher_asset }}
+          generate_release_notes: true
+          files: ${{ matrix.manager_asset }}
 
   # Каждый пуш в master пересоздаёт сборку «nightly»: из неё берёт обновление кнопка в программе.
   # Первая строка описания `commit: <sha>` сравнивается с коммитом, вшитым в запущенный файл.

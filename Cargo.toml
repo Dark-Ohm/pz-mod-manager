@@ -5,7 +5,7 @@ edition = "2024"
 license = "MIT"
 
 [workspace]
-members = ["launcher"]
+members = []
 resolver = "2"
 
 [dependencies]

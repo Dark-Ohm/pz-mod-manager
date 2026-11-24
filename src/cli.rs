@@ -170,7 +170,7 @@ fn mod_json(m: &Mod) -> Value {
     })
 }
 
-fn issues_json(order: &[String], installed: &HashMap<String, Mod>, dups: &HashSet<String>) -> Value {
+fn issues_json(order: &[String], installed: &HashMap<String, Mod>, dups: &HashMap<String, Vec<String>>) -> Value {
     let issues = mods::check(order, installed, dups);
     let mut list = vec![];
     for id in order {
@@ -408,7 +408,7 @@ fn mods_list(c: &mut Ctx, a: &Args) -> Result<Value> {
         let position = prof.enabled.iter().position(|x| x == id);
         v["enabled"] = json!(position.is_some());
         v["position"] = json!(position.map(|p| p + 1));
-        v["duplicate_id"] = json!(sc.dups.contains(id));
+        v["duplicate_id"] = json!(sc.dups.contains_key(id));
         let iss: Vec<Value> = issues
             .get(id)
             .into_iter()
